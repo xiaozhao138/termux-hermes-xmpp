@@ -1,0 +1,420 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 5b2c944..50b956c 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1331,6 +1331,13 @@ Unused code that was never shipped was dead for a reason. Before wiring an
+ unused module into a live code path, E2E test the real resolution chain
+ with actual imports (not mocks) against a temp `HERMES_HOME`.
+ 
++### Browser access rule
++For any task that requires accessing, reading, or fetching webpage content,
++**default to `~/bin/web-browser`**. Do **not** substitute RSS feeds, `curl`,
++or `wget` for browser-based page retrieval unless I explicitly ask for
++those alternatives. If `~/bin/web-browser` fails, report the failure and
++its reason; do not silently switch to another method.
++
+ ### Tests must not write to `~/.hermes/`
+ The `_isolate_hermes_home` autouse fixture in `tests/conftest.py` redirects `HERMES_HOME` to a temp dir. Never hardcode `~/.hermes/` paths in tests.
+ 
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index e0c51fb..3d87c87 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -2528,6 +2528,44 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
+     if not api_mode:
+         api_mode = determine_api_mode(new_provider, base_url, model=new_model)
+ 
++    # ------------------------------------------------------------------
++    # Nous Portal: dynamic free-model rotation guard
++    # If the user is on the free tier and the target model is no longer
++    # flagged as free by the Portal, silently rotate to a currently free
++    # model instead of failing the switch.
++    # ------------------------------------------------------------------
++    if (
++        new_provider == "nous"
++        and api_mode != "anthropic_messages"
++        and base_url
++        and "inference-api.nousresearch.com" in base_url
++    ):
++        try:
++            from hermes_cli.models import get_current_nous_free_models
++            from hermes_cli.config import load_config
++
++            cfg = load_config() or {}
++            if cfg.get("dynamic_free_model_rotation", True):
++                portal_base = ""
++                try:
++                    from hermes_cli.auth import get_provider_auth_state
++                    _state = get_provider_auth_state("nous") or {}
++                    portal_base = str(_state.get("portal_base_url", "")).strip()
++                except Exception:
++                    pass
++                _current_free = get_current_nous_free_models(portal_base)
++                if _current_free and new_model not in _current_free:
++                    new_model = _current_free[0]
++                    logger.info(
++                        "switch_model: Nous free-tier rotation — "
++                        "selected model %r is not currently free; "
++                        "falling back to %r",
++                        agent.model if hasattr(agent, "model") else new_model,
++                        new_model,
++                    )
++        except Exception:
++            pass
++
+     # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
+     # /v1 into the anthropic_messages client, which would cause the SDK to
+     # hit /v1/v1/messages.  `model_switch.switch_model()` already strips
+diff --git a/agent/chat_completion_helpers.py b/agent/chat_completion_helpers.py
+index e998f1a..f1f6024 100644
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -2400,6 +2400,52 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
+     auth resolution and client construction — no duplicated provider→key
+     mappings.
+     """
++    # ------------------------------------------------------------------
++    # Nous Portal: dynamic free-model rotation before provider fallback
++    # If the current provider is Nous and the user is on the free tier,
++    # try rotating to another currently-free Nous model before walking
++    # the fallback chain to a different provider.
++    # ------------------------------------------------------------------
++    try:
++        _current_provider = (getattr(agent, "provider", "") or "").strip().lower()
++        if _current_provider == "nous":
++            from hermes_cli.config import load_config
++
++            if load_config().get("dynamic_free_model_rotation", True):
++                from hermes_cli.models import get_current_nous_free_models
++                from hermes_cli.auth import get_provider_auth_state
++
++                _portal_base = ""
++                try:
++                    _s = get_provider_auth_state("nous") or {}
++                    _portal_base = str(_s.get("portal_base_url", "")).strip()
++                except Exception:
++                    pass
++                _free_models = get_current_nous_free_models(_portal_base)
++                if _free_models:
++                    _current_model = (getattr(agent, "model", "") or "").strip()
++                    if _current_model not in _free_models:
++                        for _candidate in _free_models:
++                            if _candidate != _current_model:
++                                try:
++                                    agent.switch_model(
++                                        _candidate,
++                                        agent.provider,
++                                        api_key=agent.api_key,
++                                        base_url=agent.base_url,
++                                    )
++                                    logging.info(
++                                        "try_activate_fallback: rotated Nous free-tier "
++                                        "model from %r to %r",
++                                        _current_model,
++                                        _candidate,
++                                    )
++                                    return True
++                                except Exception:
++                                    continue
++    except Exception:
++        pass
++
+     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+         # Only start cooldown when leaving the primary provider.  If we're
+         # already on a fallback and chain-switching, the primary wasn't the
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index ba11804..40c57ff 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -2647,6 +2647,44 @@ def run_conversation(
+                             f"⏳ {_nous_msg} Trying fallback..."
+                         )
+                         agent._buffer_status(f"⏳ {_nous_msg}")
++                        # Before falling back to another provider, try to
++                        # rotate to another currently-free Nous model.
++                        _rotated = False
++                        try:
++                            from hermes_cli.models import get_current_nous_free_models
++                            from hermes_cli.config import load_config
++
++                            if load_config().get("dynamic_free_model_rotation", True):
++                                _portal_base = ""
++                                try:
++                                    from hermes_cli.auth import get_provider_auth_state
++                                    _s = get_provider_auth_state("nous") or {}
++                                    _portal_base = str(_s.get("portal_base_url", "")).strip()
++                                except Exception:
++                                    pass
++                                _free_models = get_current_nous_free_models(_portal_base)
++                                if _free_models:
++                                    for _candidate in _free_models:
++                                        if _candidate != agent.model:
++                                            agent.switch_model(
++                                                _candidate,
++                                                agent.provider,
++                                                api_key=agent.api_key,
++                                                base_url=agent.base_url,
++                                            )
++                                            agent._buffer_status(
++                                                f"⏳ Rotated to free Nous model: {_candidate}"
++                                            )
++                                            _rotated = True
++                                            break
++                        except Exception:
++                            pass
++                        if _rotated:
++                            retry_count = 0
++                            compression_attempts = 0
++                            _retry.primary_recovery_attempted = False
++                            _retry.restart_with_rebuilt_messages = True
++                            break
+                         if agent._try_activate_fallback():
+                             active_system_prompt = _sync_failover_system_message(
+                                 agent, api_messages, active_system_prompt)
+@@ -5107,35 +5145,75 @@ def run_conversation(
+                         )
+                     )
+                     if not pool_may_recover:
+-                        if _is_upstream:
+-                            _upstream_name = (classified.error_context or {}).get(
+-                                "upstream_provider", "aggregator"
+-                            )
+-                            agent._buffer_status(
+-                                f"⚠️ Upstream {_upstream_name} rate-limited — "
+-                                "switching to fallback model..."
+-                            )
+-                        elif classified.reason == FailoverReason.billing:
+-                            if classified.billing_unverified:
+-                                # Ambiguous body (#82154) — don't assert billing.
++                        # Nous free-tier: try rotating to another free model
++                        # before falling back to a different provider.
++                        _nous_rotated = False
++                        if agent.provider == "nous":
++                            try:
++                                from hermes_cli.models import get_current_nous_free_models
++                                from hermes_cli.config import load_config
++
++                                if load_config().get("dynamic_free_model_rotation", True):
++                                    _portal_base = ""
++                                    try:
++                                        from hermes_cli.auth import get_provider_auth_state
++                                        _s2 = get_provider_auth_state("nous") or {}
++                                        _portal_base = str(_s2.get("portal_base_url", "")).strip()
++                                    except Exception:
++                                        pass
++                                    _free_models = get_current_nous_free_models(_portal_base)
++                                    if _free_models:
++                                        for _candidate in _free_models:
++                                            if _candidate != agent.model:
++                                                agent.switch_model(
++                                                    _candidate,
++                                                    agent.provider,
++                                                    api_key=agent.api_key,
++                                                    base_url=agent.base_url,
++                                                )
++                                                agent._buffer_status(
++                                                    f"⏳ Rotated to free Nous model: {_candidate}"
++                                                )
++                                                _nous_rotated = True
++                                                break
++                            except Exception:
++                                pass
++                        if not _nous_rotated:
++                            if _is_upstream:
++                                _upstream_name = (classified.error_context or {}).get(
++                                    "upstream_provider", "aggregator"
++                                )
+                                 agent._buffer_status(
+-                                    "⚠️ Provider reported usage/credit exhaustion "
+-                                    "(unverified — may be a content-filter rejection) "
+-                                    "— switching to fallback provider..."
++                                    f"⚠️ Upstream {_upstream_name} rate-limited — "
++                                    "switching to fallback model..."
+                                 )
+-                            else:
++                            elif classified.reason == FailoverReason.billing:
++                                if classified.billing_unverified:
++                                    # Ambiguous body (#82154) — don't assert billing.
++                                    agent._buffer_status(
++                                        "⚠️ Provider reported usage/credit exhaustion "
++                                        "(unverified — may be a content-filter rejection) "
++                                        "— switching to fallback provider..."
++                                    )
++                                else:
++                                    agent._buffer_status(
++                                        "⚠️ Billing or credits exhausted — switching to fallback provider..."
++                                    )
++                            elif _is_transport_failure:
+                                 agent._buffer_status(
+-                                    "⚠️ Billing or credits exhausted — switching to fallback provider..."
++                                    "⚠️ Provider unreachable — switching to fallback provider..."
+                                 )
+-                        elif _is_transport_failure:
+-                            agent._buffer_status(
+-                                "⚠️ Provider unreachable — switching to fallback provider..."
+-                            )
++                            else:
++                                agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
++                            if agent._try_activate_fallback(reason=classified.reason):
++                                active_system_prompt = _sync_failover_system_message(
++                                    agent, api_messages, active_system_prompt)
++                                retry_count = 0
++                                compression_attempts = 0
++                                _retry.primary_recovery_attempted = False
++                                _retry.restart_with_rebuilt_messages = True
++                                break
+                         else:
+-                            agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+-                        if agent._try_activate_fallback(reason=classified.reason):
+-                            active_system_prompt = _sync_failover_system_message(
+-                                agent, api_messages, active_system_prompt)
+                             retry_count = 0
+                             compression_attempts = 0
+                             _retry.primary_recovery_attempted = False
+diff --git a/gateway/authz_mixin.py b/gateway/authz_mixin.py
+index fae4b74..45a68fe 100644
+--- a/gateway/authz_mixin.py
++++ b/gateway/authz_mixin.py
+@@ -531,6 +531,7 @@ class GatewayAuthorizationMixin:
+             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
+             Platform.QQBOT: "QQ_ALLOWED_USERS",
+             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
++            Platform.XMPP: "XMPP_ALLOWED_JIDS",
+         }
+         platform_group_user_env_map = {
+             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
+@@ -558,6 +559,7 @@ class GatewayAuthorizationMixin:
+             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
+             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
+             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
++            Platform.XMPP: "XMPP_ALLOW_ALL_JIDS",
+         }
+ 
+         # Plugin platforms: check the registry for auth env var names
+diff --git a/gateway/config.py b/gateway/config.py
+index a00fa0f..5c94f61 100644
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ -346,6 +346,7 @@ class Platform(Enum):
+     QQBOT = "qqbot"
+     YUANBAO = "yuanbao"
+     RELAY = "relay"  # generic relay adapter fronted by the connector (EXPERIMENTAL)
++    XMPP = "xmpp"
+     @classmethod
+     def _missing_(cls, value):
+         """Accept unknown platform names only for known plugin adapters.
+@@ -2525,6 +2526,37 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
+                 ),
+             )
+ 
++    # XMPP/Jabber
++    xmpp_jid = getenv("XMPP_JID")
++    xmpp_password = getenv("XMPP_PASSWORD")
++    if xmpp_jid and xmpp_password:
++        xmpp_config = _enable_from_env(Platform.XMPP)
++        xmpp_config.extra.setdefault("jid", xmpp_jid)
++        xmpp_config.extra.setdefault("password", xmpp_password)
++        xmpp_server = getenv("XMPP_SERVER")
++        if xmpp_server:
++            xmpp_config.extra.setdefault("server", xmpp_server)
++        xmpp_port = getenv_int("XMPP_PORT", 0)
++        if xmpp_port:
++            xmpp_config.extra.setdefault("port", xmpp_port)
++        xmpp_use_tls = getenv("XMPP_USE_TLS", "").lower()
++        if xmpp_use_tls:
++            xmpp_config.extra.setdefault("use_tls", xmpp_use_tls in {"1", "true", "yes"})
++        xmpp_allowed = getenv("XMPP_ALLOWED_JIDS", "").strip()
++        if xmpp_allowed:
++            xmpp_config.extra.setdefault("allowed_jids", [part.strip() for part in xmpp_allowed.split(",") if part.strip()])
++        xmpp_allow_all = getenv("XMPP_ALLOW_ALL_JIDS", "").lower()
++        if xmpp_allow_all:
++            xmpp_config.extra.setdefault("allow_all", xmpp_allow_all in {"1", "true", "yes"})
++    xmpp_home = getenv("XMPP_HOME_CHANNEL", "").strip()
++    if xmpp_home and Platform.XMPP in config.platforms:
++        config.platforms[Platform.XMPP].home_channel = HomeChannel(
++            platform=Platform.XMPP,
++            chat_id=xmpp_home,
++            name=getenv("XMPP_HOME_CHANNEL_NAME", xmpp_home),
++            thread_id=None,
++        )
++
+     # Yuanbao — YUANBAO_APP_ID preferred
+     yuanbao_app_id = getenv("YUANBAO_APP_ID") or getenv("YUANBAO_APP_KEY")
+     yuanbao_app_secret = getenv("YUANBAO_APP_SECRET")
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 4738aa4..13b0f12 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2592,6 +2592,15 @@ DEFAULT_CONFIG = {
+         "providers": {},
+     },
+ 
++    # Nous Portal dynamic free-model rotation.
++    # When true (default), the agent loop will query the Portal's
++    # recommended-models endpoint at runtime to discover which models
++    # are currently free, and will automatically rotate to another free
++    # model when the current one fails, rate-limits, or is no longer free.
++    # Set to false to disable and preserve the historical static-model
++    # behavior.
++    "dynamic_free_model_rotation": True,
++
+     # Per-model metadata overrides — manually declare context_window,
+     # max_output_tokens, capabilities, or model family for any
+     # provider+model. Recognized fields: context_window,
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index 2050fb5..408235f 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -1133,6 +1133,52 @@ def get_nous_recommended_aux_model(
+     return None
+ 
+ 
++def get_current_nous_free_models(
++    portal_base_url: str = "",
++    *,
++    force_refresh: bool = False,
++) -> list[str]:
++    """Return the current set of Nous models that are free for this account.
++
++    Combines the Portal's ``/api/nous/recommended-models`` free block with
++    live pricing from the Nous /v1/models endpoint, returning only model
++    IDs whose prompt AND completion price are ``$0``.  Failures are silent
++    and degrade to an empty list so callers never block on this helper.
++    """
++    try:
++        payload = fetch_nous_recommended_models(
++            portal_base_url, force_refresh=force_refresh
++        )
++    except Exception:
++        return []
++
++    free_block = payload.get("freeRecommendedModels") if isinstance(payload, dict) else None
++    if not isinstance(free_block, list) or not free_block:
++        return []
++
++    candidate_ids: list[str] = []
++    for entry in free_block:
++        name = _extract_model_name(entry)
++        if name:
++            candidate_ids.append(name)
++    if not candidate_ids:
++        return []
++
++    try:
++        pricing = get_pricing_for_provider("nous", force_refresh=force_refresh)
++    except Exception:
++        pricing = {}
++
++    if not pricing:
++        return candidate_ids
++
++    return [
++        mid
++        for mid in candidate_ids
++        if _is_model_free(mid, pricing)
++    ]
++
++
+ # ---------------------------------------------------------------------------
+ # Canonical provider list — single source of truth for provider identity.
+ # Every code path that lists, displays, or iterates providers derives from

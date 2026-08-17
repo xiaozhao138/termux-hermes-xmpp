@@ -1,0 +1,64 @@
+# =============================================================================
+# .gitignore — 安全边界：以下内容绝不进入 GitHub
+# =============================================================================
+
+# ---- 密钥与凭据 ----
+.env
+.env.*
+!.env.example
+auth.json
+auth.lock
+shared/
+nous_auth.json
+*.pem
+*.key
+
+# ---- 运行数据库与历史 ----
+state.db
+state.db-wal
+state.db-shm
+sessions/
+*.jsonl
+pastes/
+logs/
+memories/
+kanban.db
+kanban.db-wal
+kanban.db-shm
+verification_evidence.db
+processes.json
+channel_directory.json
+gateway*.json
+gateway*.log
+gateway.lock
+gateway.pid
+interrupt_debug.log
+.hermes_history
+.history
+
+# ---- 缓存与运行时 ----
+cache/
+audio_cache/
+image_cache/
+models_dev_cache*
+provider_models_cache*
+ollama_cloud_models_cache*
+context_length_cache.yaml
+.skills_prompt_snapshot.json
+
+# ---- venv / 源码克隆产物（restore.sh 会重新克隆到 ~/.hermes，不在仓库内） ----
+venv/
+.venv/
+hermes-agent/
+
+# ---- 备份产物 ----
+backups/
+*.tar.gz
+*.bak
+.bak/
+.backup_*/
+
+# ---- 杂项 ----
+__pycache__/
+*.pyc
+.DS_Store

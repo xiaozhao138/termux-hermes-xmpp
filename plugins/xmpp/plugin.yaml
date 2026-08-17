@@ -1,0 +1,43 @@
+name: xmpp-platform
+label: XMPP
+kind: platform
+version: 1.0.0
+description: >
+  XMPP/Jabber gateway adapter for Hermes Agent.
+  Connects to an XMPP server and relays messages between
+  an XMPP account and the Hermes agent.
+author: Community
+requires_env:
+  - name: XMPP_JID
+    description: "Full XMPP JID, e.g. hermes@sky.959011.xyz"
+    prompt: "XMPP JID"
+    password: false
+  - name: XMPP_PASSWORD
+    description: "Account password for the XMPP JID"
+    prompt: "XMPP password"
+    password: true
+optional_env:
+  - name: XMPP_SERVER
+    description: "XMPP hostname, e.g. sky.959011.xyz (auto-derived from JID when empty)"
+    prompt: "XMPP server host"
+    password: false
+  - name: XMPP_PORT
+    description: "XMPP port (default: 5222)"
+    prompt: "XMPP port"
+    password: false
+  - name: XMPP_USE_TLS
+    description: "Use STARTTLS/TLS for client connection (1/true/yes to enable, default: true)"
+    prompt: "Use TLS? (true/false)"
+    password: false
+  - name: XMPP_ALLOWED_JIDS
+    description: "Comma-separated XMPP JIDs allowed to talk to the bot"
+    prompt: "Allowed JIDs (comma-separated)"
+    password: false
+  - name: XMPP_ALLOW_ALL_JIDS
+    description: "Allow any JID to talk to the bot (dev only)"
+    prompt: "Allow all JIDs? (true/false)"
+    password: false
+  - name: XMPP_HOME_CHANNEL
+    description: "JID used for cron / notification delivery"
+    prompt: "Home JID (or empty)"
+    password: false
