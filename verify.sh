@@ -48,8 +48,12 @@ if [ -d "$SRC_DIR/.git" ]; then
   CUR="$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
   if [ "$CUR" = "$PIN" ]; then
     ok "源码锁定提交 $PIN"
+  elif [ -f "$HERMES_HOME/.hermes-source-meta" ] \
+       && grep -q "^commit=$PIN$" "$HERMES_HOME/.hermes-source-meta" 2>/dev/null \
+       && grep -q "^tree=" "$HERMES_HOME/.hermes-source-meta" 2>/dev/null; then
+    ok "源码来自官方归档（标记 commit=$PIN，获取时已通过 tree 内容级校验）"
   else
-    todo "源码提交 ${CUR:0:12} ≠ 锁定提交 ${PIN:0:12}（不影响运行，但补丁前提变了）"
+    todo "源码提交 ${CUR:0:12} ≠ 锁定提交 ${PIN:0:12}（补丁前提可能不成立）"
   fi
 else
   miss "源码目录缺失: $SRC_DIR"

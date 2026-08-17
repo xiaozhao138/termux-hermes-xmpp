@@ -43,10 +43,15 @@ cd <本仓库名>
 | `verify.sh` | 健康检查：核心/补丁/插件/依赖/配置/Gateway 六组状态 | - |
 | `backup.sh` | 导出脱敏安全备份（不含任何密钥/数据库/历史） | 是 |
 
-- **restore.sh 幂等规则**：检测到已有源码在锁定提交且补丁已应用 → 跳过；
+- **restore.sh 幂等规则**：检测到已有源码在锁定提交（或源码标记有效）且补丁已应用 → 跳过；
   状态不同 → 停止并报告（`FORCE=1` 才备份重建）；**绝不覆盖**现有
   `config.yaml` / `.env` / `auth.json` / 已有插件。
 - **补丁严格绑定** `45af7a7`：`git apply --check` 失败立即停止，不强行改源码。
+- **源码获取多级回退**（针对 GitHub 临时 429 / HTTP/2 RPC 异常 / 浅克隆抓取历史 SHA 失败）：
+  阶段1 浅克隆+锁定SHA（自动重试并升级 HTTP/1.1、protocol v1）→ 阶段2 完整克隆 →
+  阶段3 官方源码归档（codeload tar.gz + 根树哈希内容级校验）。任何路径都只接受
+  精确等于 `45af7a7` 的源码；全部失败才停止并给出诊断。获取成功后写入
+  `~/.hermes/.hermes-source-meta`（commit/tree/via 标记），verify.sh 据此识别归档源。
 - **verify.sh 退出码**：0 = 无缺失项；1 = 有缺失项（待办项不影响退出码）。
   可直接 `./verify.sh` 查看，也支持 `HERMES_HOME=/path ./verify.sh`。
 
